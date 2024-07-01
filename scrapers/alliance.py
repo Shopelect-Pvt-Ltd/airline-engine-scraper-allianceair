@@ -82,7 +82,7 @@ def attempt_login(driver, date, pnr, airline):
                     logging.info(f"{filepath} has been deleted.")
                 else:
                     logging.info(f"{filepath} does not exist.")
-                return True, pdf_status
+                return True, pdf_s3link
             else:
                 return False, None
 
