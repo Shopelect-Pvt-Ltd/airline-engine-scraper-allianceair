@@ -17,17 +17,17 @@ aws_secret_access_key=os.getenv('AWS_SECRET')
 region_name='ap-south-1'
 
 sqs_client = boto3.client('sqs', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, region_name=region_name)
-queue_url = os.getenv('AIRLINE_ENGINE_SCRAPER_INPUT_Alliance_Q')
+queue_url = os.getenv('AIRLINE_ENGINE_SCRAPER_INPUT_ALLIANCEAIR_Q')
 engine_update_queue_url = os.getenv('AIRLINE_ENGINE_SCRAPER_OUTPUT_Q')
 max_messages = 10
 max_workers = 5
 
 def process_each_message(message):
     try:
+        logging.info(message)
         scraping_data = json.loads(message['Body'])
         guid = scraping_data['guid']
-        data = json.loads(scraping_data['data'])
-
+        data = scraping_data['data']
         scraper = alliance_scraper
         if scraper:
             response = scraper(data)
@@ -36,7 +36,6 @@ def process_each_message(message):
                 QueueUrl=engine_update_queue_url,
                 MessageBody=json.dumps(response)
             )
-
     except Exception as e:
         message = {
             "guid": guid,

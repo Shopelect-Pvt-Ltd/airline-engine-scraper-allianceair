@@ -1,6 +1,4 @@
-import requests
-import json
-import os
+import logging
 import time
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -8,89 +6,131 @@ from selenium.webdriver.common.by import By
 from PIL import Image
 from io import BytesIO
 import base64
-import requests
 from webdriver_manager.chrome import ChromeDriverManager
-import csv
-import os
 import utils.captcha as captcha
+import os
 from utils import s3
-from utils.log import get_logger
-import tempfile
-
-logger = get_logger()
-
-URL = "https://api.airasia.co.in/b2c-gstinvoice/v1/invoice-data/gst"
-PDF_URL = "https://api.airasia.co.in/b2c-gstinvoice/v1/invoice-pdf/gst"
-HEADERS = {
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-    'Connection': 'keep-alive',
-    'Content-Type': 'application/json',
-    'Ocp-Apim-Subscription-Key': 'fe65ec9eec2445d9802be1d6c0295158',
-    'Origin': 'https://www.airasia.co.in',
-    'Referer': 'https://www.airasia.co.in/',
-    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
-}
 
 
-def airasia_scraper(data):
+def create_web_driver():
+    options = webdriver.ChromeOptions()
+    prefs = {
+        "download.default_directory": os.path.join(os.getcwd(), "temp"),
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        "directory_upgrade": True
+    }
+    options.add_experimental_option("prefs", prefs)
+    options.add_experimental_option("excludeSwitches", ['enable-automation'])
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--window-size=1920,1400")
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument("--headless")
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.implicitly_wait(1)
+    return driver
+
+
+def attempt_login(driver, date, pnr, airline):
+    try:
+        url = 'https://allianceair.co.in/gst/'
+        driver.get(url)
+        time.sleep(5)
+
+        driver.find_element(By.ID, "txtDOJ").click()
+        driver.find_element(By.ID, "txtDOJ").clear()
+        driver.find_element(By.ID, "txtDOJ").send_keys(date)
+        time.sleep(3)
+        driver.find_element(By.ID, "txtPNR").click()
+        driver.find_element(By.ID, "txtPNR").clear()
+        driver.find_element(By.ID, "txtPNR").send_keys(pnr)
+        time.sleep(3)
+
+        captcha_image_element = driver.find_element(By.ID, "Image1")
+        captcha_image_data = captcha_image_element.screenshot_as_png
+
+        image = Image.open(BytesIO(captcha_image_data))
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        captcha_id, captcha_text = captcha.get_captcha_base64(base64_image)
+        print("CaptchaEarlier----------", captcha_text)
+        time.sleep(2)
+        captcha_text_cap = captcha_text.upper()
+        print("Captcha----------", captcha_text_cap)
+
+        driver.find_element(By.ID, "txtVerificationCodeNew").click()
+        driver.find_element(By.ID, "txtVerificationCodeNew").clear()
+        driver.find_element(By.ID, "txtVerificationCodeNew").send_keys(captcha_text)
+        button = driver.find_element(By.XPATH, f'//*[@id="btnSearch"]')
+        button.click()
+        time.sleep(5)
+        try:
+            driver.find_element(By.ID, "lnkdownload").click()
+            filename = driver.find_element(By.XPATH, '//*[@id="lbl"]').text
+            if filename:
+                print("Files downloaded")
+                filepath = os.path.join(os.getcwd(), "temp") + "/" + filename + ".pdf"
+                pdf_status, pdf_s3link = s3.upload_s3(filepath, filename + ".pdf", airline)
+                logging.info("File Uploaded to S3")
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    logging.info(f"{filepath} has been deleted.")
+                else:
+                    logging.info(f"{filepath} does not exist.")
+                return True, pdf_status
+            else:
+                return False, None
+
+        except Exception as e:
+            print("Files not downloaded:", e)
+            return False, None
+
+    except Exception as e:
+        print("Error during login or form submission:", e)
+        return False, None
+
+
+def alliance_scraper(data):
+    max_attempts = 3
     try:
         vendor = data['Vendor']
-        airline = 'airasia'
-        if vendor == 'Air India Express':
-            airline = 'airindiaexpress'
+        airline = 'alliance'
+        if vendor is None and vendor == 'ALLIANCE AIR':
+            airline = 'alliance'
         pnr = data['Ticket/PNR']
-        code = data['Origin']
-        payload = json.dumps({
-            "pnr": pnr,
-            "originCode": code
-        })
-        response = requests.post(URL, headers=HEADERS, data=payload)
-        if response.status_code == 200:
-            data = response.json()
-            for inv in data["data"]["Invoices"]:
-                invoice_number = inv.get(
-                    "invoiceNumber", inv.get("creditNumber", ""))
-                invoice_type = ""
-                inv_type = inv.get("type")
-                if inv_type == "BOS":
-                    invoice_type = "Bill of Supply"
-                elif inv_type == "INV":
-                    invoice_type = "Tax Invoice"
-                elif inv_type == "CR":
-                    invoice_type = "Credit Note"
+        date = data['Transaction_Date']
+        success = False
+        for attempt in range(max_attempts):
+            driver = create_web_driver()
+            status, pdf_s3link = attempt_login(driver, date, pnr, airline)
+            if status:
+                success = True
+                return {
+                    "success": True,
+                    "message": "FILE_PUSHED_TO_S3",
+                    "data": {'s3_link': [pdf_s3link], 'airline': airline}
+                }
 
-                pdf_payload = json.dumps({
-                    "invoiceNumber": invoice_number,
-                    "type": inv_type
-                })
+            else:
+                print(f"Attempt {attempt + 1} failed for PNR: {pnr}. Retrying...")
 
-                response = requests.post(
-                    PDF_URL, headers=HEADERS, data=pdf_payload)
-
-                file_name = f'{invoice_number}_{pnr}_{invoice_type}.pdf'
-
-                with tempfile.NamedTemporaryFile(mode='wb') as temp_file:
-                    # Write to the temporary file
-                    temp_file.write(response.content)
-
-
-                    pdf_status, pdf_s3link = s3.upload_s3(temp_file.name, file_name, airline)
-                    if pdf_status:
-                        logger.info("File Uploaded to S3")
-                        return {
-                            "success": True,
-                            "message": "FILE_PUSHED_TO_S3",
-                            "data": {'s3_link': [pdf_s3link],'airline':airline}
-                        }
-                    else:
-                        raise Exception("ERROR_FILE_PUSH")
-        else:
-            raise Exception("ERROR_RESPONSE")
+            driver.quit()  # Ensure the browser is closed before retrying
+        if not success:
+            print(f"Failed to download files after {max_attempts} attempts for PNR: {pnr}")
+            return {
+                "success": False,
+                "message": "ERROR_PROCESSING",
+                "data": {}
+            }
     except Exception as e:
-        logger.exception(f"Got an exception {e}")
+        print("Error in alliance_scraper function:", e)
         return {
             "success": False,
-            "message": e.args[0],
+            "message": "ERROR_PROCESSING",
             "data": {}
         }
