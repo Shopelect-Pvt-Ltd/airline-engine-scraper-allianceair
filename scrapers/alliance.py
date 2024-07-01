@@ -100,7 +100,7 @@ def alliance_scraper(data):
     try:
         vendor = data['Vendor']
         airline = 'alliance'
-        if vendor is None and vendor == 'ALLIANCE AIR':
+        if vendor == 'ALLIANCE AIR':
             airline = 'alliance'
         pnr = data['Ticket/PNR']
         date = data['Transaction_Date']
